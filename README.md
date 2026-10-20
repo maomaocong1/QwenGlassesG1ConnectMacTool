@@ -6,9 +6,20 @@
 
 | Tab | 功能 |
 |-----|------|
-| BLE 扫描 / GATT | CoreBluetooth 实时扫描，按名称过滤（qwen/g1/quark/glass），RSSI 排序；连接后自动发现全部服务/特征并读取，GATT 控制台支持 读 / 写(hex) / 订阅通知，全部报文进日志（逆向用） |
-| 音频配对 (Classic) | Classic 设备搜索（IOBluetoothDeviceInquiry）；程序化配对（`IOBluetoothDevicePair`，自动回 PIN `0000`、自动确认数字比较）；失败时一键跳转系统蓝牙设置；实时监控已配对/连接状态 |
+| BLE 扫描 / GATT | CoreBluetooth 实时扫描，按名称过滤（qwen/g1/quark/glass），RSSI 排序；连接后自动发现全部服务/特征并读取，GATT 控制台支持 读 / 写(hex) / 订阅通知 / 一键全部订阅，全部报文进日志（逆向用） |
+| 音频配对 (Classic) | **强制 BR/EDR 连接**（`openConnection + authenticationRequired`，Just Works 免配对码）→ SDP 注册 A2DP/HFP → 设备出现在音频列表；失败回退 `IOBluetoothDevicePair`（支持手动 PIN/数字比较响应）；陈旧连接自动断开重配；实时监控配对/连接状态 |
 | 报文日志 | 全量 ADV/GATT/CONN/PAIR 日志，hex + ascii，可过滤、复制、清空 |
+
+## 已验证的关键结论（Qwen Glasses G1）
+
+- 眼镜是**双模设备**：BLE 走阿里私有 `FEB3` 服务（"WoW" 协议，特征 FED4-FED8，App 数据通道）；音频走 **Classic A2DP/HFP**
+- 广播 Manufacturer Data：公司 ID `0x01A8`（Alibaba），内含 MAC（小端序，与设备名后缀一致）
+- **坑**：普通配对（IOBluetoothDevicePair / 系统弹窗）对已有 LE bond 的双模设备会走 LE 通道，产生"只绑 BLE"的假配对（`Services: <BLE>`），音频列表不出现
+- **解法**：强制 BR/EDR page + `authenticationRequired:YES` 触发 Just Works 配对（无需配对码，与 Android 系统配对行为一致），连接后 SDP 自动注册 A2DP/HFP → 出现在 系统设置 > 声音
+- forget device 后眼镜会带旧绑定自动回连（isConnected=true 但 isPaired=false 的"陈旧连接"），需先断开再配对（工具已自动处理）
+- **系统弹出"配对码"弹窗时直接点「配对/确认」**：眼镜无屏幕不显示码；要求输 PIN 时填 0000
+- BLE 连接后**不要盲目读取特征**：读需要加密链路的特征会触发 macOS 的 LE 配对弹窗，产生"只绑 BLE"的假配对（工具已改为手动触发读取）
+- 命令行独立验证工具：`swift tools/classic_connect.swift [MAC]`
 
 ## 构建与运行
 
@@ -23,11 +34,12 @@ open build/QwenGlasses.app
 
 ## 使用流程
 
-1. 让眼镜进入配对模式（通常是长按电源键，指示灯快闪）
-2. **BLE**：打开 App 自动开始扫描，找到 "Qwen Glasses G1" → 「一键连接」→ 在 GATT 控制台浏览/读写特征值
-3. **音频 (Classic)**：切到「音频配对」Tab → 「搜索 Classic 设备」→ 对眼镜点「配对」
-   - 自动配对失败时点「打开系统蓝牙设置」手动配对，本工具会自动检测到配对成功并刷新状态
-4. 配对成功后在 系统设置 → 声音 中即可将眼镜选为音频输出
+1. **音频 (Classic)**：切到「音频配对」Tab → 直接点上次配对设备的「重新配对」，或「搜索 Classic 设备」后点「配对」
+   - 工具优先走**强制 BR/EDR 连接**（已验证，约 10-20 秒，Just Works 无需配对码）
+   - 若眼镜在系统设置里被 forget 过又自动回连，工具会先断开陈旧连接再配对
+   - 成功后眼镜即出现在 系统设置 → 声音 的输出/输入列表
+2. **BLE 数据通道**：「BLE 扫描」Tab → 找到 "Qwen Glasses G1" → 「一键连接」→ GATT 控制台浏览/读写 FEB3 服务特征
+3. 命令行快速验证音频链路：`swift tools/classic_connect.swift C4:D7:DC:40:55:87`
 
 ## BLE ↔ Classic 地址关联
 
@@ -51,10 +63,11 @@ Sources/QwenGlasses/
 Resources/Info.plist           # NSBluetoothAlwaysUsageDescription
 Resources/entitlements.plist   # com.apple.security.device.bluetooth（未开沙盒）
 scripts/bundle.sh              # 一键打包
+tools/classic_connect.swift    # CLI：强制 Classic 连接验证工具
 ```
 
 ## 已知限制
 
-- Classic 程序化配对是尽力而为：部分 macOS 版本/设备组合下系统仍会弹自己的配对面板，此时按系统提示操作即可，工具会自动感知结果
-- 眼镜若不在配对模式，Classic 搜索无法发现它（不可发现状态）
-- 无协议文档，GATT 控制台只提供原始读写能力；特征值含义需结合「报文日志」Tab 自行分析
+- 强制 Classic 连接要求眼镜 Classic 侧可被 page（正常开机即可；若刚 forget 过，可能需重新进配对模式）
+- BLE 私有 FEB3 "WoW" 协议无文档：FED4-FED8 均为 1 字节标志位，设备对盲写只回 `0x00`（未认证），完整 App 级功能（拍照/AI 等）需逆向官方 App 握手（可用 Android HCI snoop log + tshark 分析）
+- GATT 控制台只提供原始读写能力；特征值含义需结合「报文日志」Tab 自行分析

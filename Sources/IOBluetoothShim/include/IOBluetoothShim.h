@@ -38,6 +38,22 @@ BOOL QGIsPaired(NSString *address);
 BOOL QGIsConnected(NSString *address);
 NSString *_Nullable QGDeviceName(NSString *address);
 
+/// 断开与设备的基带连接（用于 forget 之后设备用旧绑定自动回连的陈旧连接）。
+/// 返回 0 表示成功。
+int32_t QGDisconnectDevice(NSString *address);
+
+/// 对已连接设备主动发起认证（无链路键时会触发系统配对流程）。
+/// 返回 0 表示成功。
+int32_t QGRequestAuthentication(NSString *address);
+
+/// 强制 Classic (BR/EDR) 连接 + 认证配对回调（主线程）。
+typedef void (^QGClassicConnectCompletion)(NSString *address, BOOL success, NSString *_Nullable message);
+
+/// 强制走 Classic 通道：BR/EDR page（约10秒超时）+ authenticationRequired（触发 Just Works 配对），
+/// 成功后执行 SDP 服务发现（注册 A2DP/HFP，使设备出现在音频列表）。
+/// 这是让双模设备（BLE+Classic）在 macOS 上成为音频设备的可靠方式。
+void QGOpenClassicConnection(NSString *address, BOOL authRequired, NSTimeInterval sdpTimeout, QGClassicConnectCompletion _Nullable completion);
+
 /// 已配对设备的地址列表。
 NSArray<NSString *> *QGPairedAddresses(void);
 

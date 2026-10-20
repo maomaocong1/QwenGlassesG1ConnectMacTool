@@ -34,7 +34,7 @@ struct DeviceDetailView: View {
                     Text(connection.name).font(.headline)
                     statusBadge
                 }
-                Text("MTU 写上限: \(connection.mtu) 字节 · \(connection.services.count) 个服务")
+                Text("MTU 写上限: \(connection.mtu) 字节 · \(connection.services.count) 个服务 · ⚠️ 读取加密特征会触发系统配对弹窗")
                     .font(.caption)
                     .foregroundStyle(.secondary)
             }

@@ -128,10 +128,8 @@ extension BLEConnection: CBPeripheralDelegate {
               let chars = service.characteristics else { return }
         log.log(.rx, tag: "GATT", "服务 \(service.uuid.uuidString): \(chars.count) 个特征 [\(chars.map(\.uuid.uuidString).joined(separator: ", "))]")
         services[idx].chars = chars.map { GattCharItem(cb: $0) }
-        // 自动读取所有可读特征，便于逆向
-        for c in chars where c.properties.contains(.read) {
-            peripheral.readValue(for: c)
-        }
+        // 注意：不自动读取。读取需要加密链路的特征会触发 macOS 系统配对弹窗
+        //（设备无屏幕时用户无从确认），改为手动点「读取」或「全部重读」触发。
     }
 
     func peripheral(_ peripheral: CBPeripheral, didUpdateValueFor characteristic: CBCharacteristic, error: Error?) {

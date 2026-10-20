@@ -166,6 +166,9 @@ struct PairingView: View {
             Text("1. 让眼镜进入配对模式 → 2. 点击搜索 Classic 设备 → 3. 在下方列表中点击「配对」。若自动配对失败，请用系统蓝牙设置手动配对（工具会自动检测配对成功）。")
                 .font(.caption)
                 .foregroundStyle(.secondary)
+            Text("💡 若系统弹出配对请求（显示一串数字码）：直接点「配对/确认」即可——眼镜无屏幕、不会显示码，属正常现象；若要求输入 PIN，填 0000。")
+                .font(.caption)
+                .foregroundStyle(.blue)
             Text("⚠️ 部分眼镜需先在 BLE 通道完成 App 握手后才开放 Classic 配对。若配对一直无响应（无 PIN/确认请求），请切到「BLE 扫描 / GATT」Tab 连接后点「全部订阅通知」，观察日志中设备主动推送的数据。")
                 .font(.caption)
                 .foregroundStyle(.orange)
@@ -187,6 +190,46 @@ struct PairingView: View {
                     .buttonStyle(.bordered)
                     .disabled(classic.phase == .pairing)
                 }
+            }
+            if !classic.lastPairedAddress.isEmpty {
+                Divider()
+                HStack(spacing: 8) {
+                    Image(systemName: "clock.arrow.circlepath")
+                        .foregroundStyle(classic.lastDeviceStale ? .orange : .secondary)
+                    VStack(alignment: .leading, spacing: 1) {
+                        HStack(spacing: 5) {
+                            Text("上次配对：\(classic.lastPairedName.isEmpty ? classic.lastPairedAddress : classic.lastPairedName)")
+                                .font(.callout)
+                            if classic.lastDeviceStale {
+                                Text("陈旧连接")
+                                    .font(.caption2)
+                                    .padding(.horizontal, 5)
+                                    .padding(.vertical, 1)
+                                    .background(.orange.opacity(0.25), in: Capsule())
+                            }
+                        }
+                        Text(classic.lastPairedAddress)
+                            .font(.caption2.monospaced())
+                            .foregroundStyle(.secondary)
+                            .textSelection(.enabled)
+                    }
+                    Spacer()
+                    Button(classic.lastDeviceStale ? "断开并重新配对" : "重新配对") {
+                        classic.pair(address: classic.lastPairedAddress, name: classic.lastPairedName)
+                    }
+                    .buttonStyle(.borderedProminent)
+                    .tint(classic.lastDeviceStale ? .orange : .accentColor)
+                    .disabled(classic.phase == .pairing)
+                    Button {
+                        classic.forgetLastDevice()
+                    } label: {
+                        Image(systemName: "trash")
+                    }
+                    .buttonStyle(.borderless)
+                    .help("清除记忆")
+                }
+                .padding(8)
+                .background(.quaternary.opacity(0.3), in: RoundedRectangle(cornerRadius: 8))
             }
         }
         .padding(12)
@@ -280,11 +323,19 @@ struct PairingView: View {
                 TextField("MAC 地址，如 12:34:56:AB:CD:EF", text: $classic.manualAddress)
                     .textFieldStyle(.roundedBorder)
                     .font(.callout.monospaced())
+                Button("检查状态") { classic.checkManualAddressState() }
+                    .buttonStyle(.bordered)
                 Button("配对") {
                     classic.pair(address: classic.manualAddress, name: "")
                 }
                 .buttonStyle(.borderedProminent)
                 .disabled(classic.phase == .pairing)
+            }
+            if !classic.manualStateText.isEmpty {
+                Text(classic.manualStateText)
+                    .font(.caption)
+                    .foregroundStyle(classic.manualStateText.contains("⚠️") ? .orange : .secondary)
+                    .textSelection(.enabled)
             }
             Text("提示：眼镜的 Classic 地址通常与 BLE 广播厂商数据中的 MAC 相同或 ±1。")
                 .font(.caption)
@@ -312,6 +363,14 @@ struct ClassicDeviceRow: View {
                             .padding(.horizontal, 5)
                             .padding(.vertical, 1)
                             .background(.green.opacity(0.2), in: Capsule())
+                    }
+                    if !device.paired && device.connected {
+                        Text("陈旧连接")
+                            .font(.caption2)
+                            .padding(.horizontal, 5)
+                            .padding(.vertical, 1)
+                            .background(.orange.opacity(0.25), in: Capsule())
+                            .help("设备未配对但仍连着（forget 后设备用旧绑定回连）。点「配对」会自动先断开再重新配对。")
                     }
                 }
                 Text(device.address).font(.caption2.monospaced()).foregroundStyle(.secondary)

@@ -48,6 +48,12 @@ final class ClassicPairingModel: NSObject, ObservableObject {
     @Published var awaitingConfirm = false
     @Published var confirmValue = ""
     @Published var pairingAddress = ""
+    @Published var manualStateText = ""
+
+    // 上次配对成功的设备（用于 forget 后快速重新配对）
+    @Published var lastPairedAddress: String = UserDefaults.standard.string(forKey: "lastPairedAddress") ?? ""
+    @Published var lastPairedName: String = UserDefaults.standard.string(forKey: "lastPairedName") ?? ""
+    @Published var lastDeviceStale = false
 
     private var inquiry: IOBluetoothDeviceInquiry?
     private var watcher: Any?
@@ -88,8 +94,55 @@ final class ClassicPairingModel: NSObject, ObservableObject {
                 connected: QGIsConnected(addr)
             ))
         }
+        // 上次配对设备的陈旧连接检测（forget 后设备用旧绑定回连）
+        var stale = false
+        if !lastPairedAddress.isEmpty {
+            stale = !QGIsPaired(lastPairedAddress) && QGIsConnected(lastPairedAddress)
+        }
         DispatchQueue.main.async {
             self.pairedDevices = list.sorted { $0.name < $1.name }
+            self.lastDeviceStale = stale
+            // 上次设备已被 forget 且未回连时清掉记忆
+            if !self.lastPairedAddress.isEmpty,
+               !QGIsPaired(self.lastPairedAddress), !QGIsConnected(self.lastPairedAddress),
+               !list.contains(where: { $0.address == self.lastPairedAddress }) {
+                // 保留记忆（可能只是暂时不在范围内），仅当用户手动清除时删除
+            }
+        }
+    }
+
+    func rememberPairedDevice(address: String) {
+        lastPairedAddress = address
+        lastPairedName = QGDeviceName(address) ?? ""
+        UserDefaults.standard.set(lastPairedAddress, forKey: "lastPairedAddress")
+        UserDefaults.standard.set(lastPairedName, forKey: "lastPairedName")
+    }
+
+    func forgetLastDevice() {
+        lastPairedAddress = ""
+        lastPairedName = ""
+        lastDeviceStale = false
+        UserDefaults.standard.removeObject(forKey: "lastPairedAddress")
+        UserDefaults.standard.removeObject(forKey: "lastPairedName")
+    }
+
+    func checkManualAddressState() {
+        let addr = manualAddress.trimmingCharacters(in: .whitespaces).uppercased()
+        guard !addr.isEmpty else {
+            manualStateText = "请先输入地址"
+            return
+        }
+        let paired = QGIsPaired(addr)
+        let connected = QGIsConnected(addr)
+        let name = QGDeviceName(addr) ?? ""
+        if paired && connected {
+            manualStateText = "\(name) 已配对且已连接 ✓"
+        } else if paired {
+            manualStateText = "\(name) 已配对，未连接"
+        } else if connected {
+            manualStateText = "⚠️ \(name) 未配对但仍连接（陈旧链路）——点「配对」将自动断开后重新配对"
+        } else {
+            manualStateText = "\(name.isEmpty ? "设备" : name) 未配对、未连接（需进入配对模式）"
         }
     }
 
@@ -139,7 +192,61 @@ final class ClassicPairingModel: NSObject, ObservableObject {
         awaitingPIN = false
         awaitingConfirm = false
         confirmValue = ""
-        statusMessage = "正在与 \(name.isEmpty ? addr : name) (\(addr)) 配对…"
+
+        // forget device 后，眼镜常带着旧绑定自动回连：isConnected=true 但 isPaired=false。
+        // 这种陈旧链路会导致配对失败，先断开再配对。
+        let stale = !QGIsPaired(addr) && QGIsConnected(addr)
+        if stale {
+            statusMessage = "检测到陈旧连接（设备用旧绑定回连），正在断开后重新配对…"
+            log.log(.sys, tag: "PAIR", "\(addr) 未配对但已连接（陈旧链路），先断开")
+            pairEvents.append(PairEventItem(time: Date(), event: "stale_link",
+                                            detail: "检测到陈旧连接，正在断开…"))
+            let ret = QGDisconnectDevice(addr)
+            log.log(.sys, tag: "PAIR", "closeConnection 返回 0x\(String(format: "%08x", ret))")
+            DispatchQueue.main.asyncAfter(deadline: .now() + 2.0) { [weak self] in
+                self?.startPairing(addr: addr, name: name)
+            }
+        } else {
+            statusMessage = "正在与 \(name.isEmpty ? addr : name) (\(addr)) 配对…"
+            startPairing(addr: addr, name: name)
+        }
+    }
+
+    private func startPairing(addr: String, name: String) {
+        guard phase == .pairing else { return } // 已被取消
+
+        // 策略 1（已验证）：强制 BR/EDR page + authenticationRequired 触发 Just Works 配对，
+        // 成功后 SDP 注册 A2DP/HFP —— 双模设备（如 Qwen Glasses G1）成为音频设备的可靠方式。
+        pairEvents.append(PairEventItem(time: Date(), event: "classic_page",
+                                        detail: "尝试强制 Classic 连接 (BR/EDR + Just Works)…"))
+        log.log(.sys, tag: "PAIR", "策略1: 强制 Classic 连接 \(addr)")
+        statusMessage = "正在强制 Classic 连接（约需 10-20 秒）…"
+
+        QGOpenClassicConnection(addr, true, 25) { [weak self] a, success, message in
+            guard let self, self.phase == .pairing, self.pairingAddress == a else { return }
+            let msg = message ?? ""
+            self.pairEvents.append(PairEventItem(time: Date(),
+                                                 event: success ? "classic_ok" : "classic_fail", detail: msg))
+            self.log.log(success ? .sys : .rx, tag: "PAIR", "策略1\(success ? "成功" : "失败"): \(msg)")
+            if success {
+                self.awaitingPIN = false
+                self.awaitingConfirm = false
+                self.phase = .success("\(a) Classic 已连接")
+                self.statusMessage = "配对成功：\(msg)。眼镜应已出现在 系统设置 > 声音 的输出/输入列表。"
+                self.rememberPairedDevice(address: a)
+                self.refreshPaired()
+            } else {
+                // 策略 2 回退：IOBluetoothDevicePair（可能走 LE 通道）
+                self.pairEvents.append(PairEventItem(time: Date(), event: "fallback",
+                                                     detail: "回退到 IOBluetoothDevicePair 配对…"))
+                self.startLegacyPairing(addr: a)
+            }
+        }
+    }
+
+    private func startLegacyPairing(addr: String) {
+        guard phase == .pairing else { return }
+        statusMessage = "强制 Classic 失败，尝试常规配对…"
         log.log(.sys, tag: "PAIR", "发起配对: \(addr) autoPIN=\(autoPIN ? pinCode : "手动") autoConfirm=\(autoConfirm)")
 
         let autoPINValue: String? = (autoPIN && !pinCode.isEmpty) ? pinCode : nil
@@ -169,10 +276,17 @@ final class ClassicPairingModel: NSObject, ObservableObject {
                 self.phase = .success("\(a) 配对成功 \(msg)")
                 self.statusMessage = "配对成功：\(a)。现在可在 系统设置 > 声音 中将眼镜设为音频输出。"
                 self.log.log(.sys, tag: "PAIR", "配对成功: \(a)")
+                self.rememberPairedDevice(address: a)
             } else {
+                var hint = ""
+                if msg.contains("0x00000005") || msg.lowercased().contains("auth") {
+                    hint = "。认证失败通常是眼镜端还存着旧绑定：请让眼镜重新进入配对模式（长按电源键）后再试"
+                } else if msg.contains("超时") {
+                    hint = "。请确认眼镜处于配对模式；若眼镜仍显示已连接手机，请先在手机 App 中断开/解绑"
+                }
                 self.phase = .failure(msg)
-                self.statusMessage = "配对失败：\(msg)"
-                self.log.log(.sys, tag: "PAIR", "配对失败: \(a) — \(msg)")
+                self.statusMessage = "配对失败：\(msg)\(hint)"
+                self.log.log(.sys, tag: "PAIR", "配对失败: \(a) — \(msg)\(hint)")
             }
             self.refreshPaired()
         }
