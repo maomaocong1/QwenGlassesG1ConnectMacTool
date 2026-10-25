@@ -2,16 +2,16 @@ import SwiftUI
 
 struct ContentView: View {
     @StateObject private var scanner = BLEScanner()
-    @StateObject private var classic = ClassicPairingModel()
+    @StateObject private var connector = GlassesConnector()
     @ObservedObject private var log = LogStore.shared
 
     var body: some View {
         TabView {
-            ScanView(scanner: scanner, classic: classic)
-                .tabItem { Label("BLE 扫描 / GATT", systemImage: "antenna.radiowaves.left.and.right") }
+            ConnectView(connector: connector)
+                .tabItem { Label("连接眼镜", systemImage: "ear") }
 
-            PairingView(classic: classic, scanner: scanner)
-                .tabItem { Label("音频配对 (Classic)", systemImage: "ear") }
+            ScanView(scanner: scanner)
+                .tabItem { Label("BLE 调试", systemImage: "antenna.radiowaves.left.and.right") }
 
             LogView(log: log)
                 .tabItem { Label("报文日志", systemImage: "list.bullet.rectangle") }
@@ -24,7 +24,6 @@ struct ContentView: View {
 
 struct ScanView: View {
     @ObservedObject var scanner: BLEScanner
-    @ObservedObject var classic: ClassicPairingModel
     @State private var selection: DiscoveredDevice.ID?
 
     var body: some View {

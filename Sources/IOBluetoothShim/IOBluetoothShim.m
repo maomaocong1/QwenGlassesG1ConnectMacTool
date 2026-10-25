@@ -2,199 +2,137 @@
 #import <IOBluetooth/IOBluetooth.h>
 #import <AppKit/AppKit.h>
 
-#pragma mark - 配对任务
+#pragma mark - 日志
 
-@interface QGBridge : NSObject
-+ (NSMutableSet *)agents;
-+ (void)removeAgent:(id)agent;
+static void QGLog(NSString *fmt, ...) {
+    va_list args;
+    va_start(args, fmt);
+    NSString *msg = [[NSString alloc] initWithFormat:fmt arguments:args];
+    va_end(args);
+    static NSDateFormatter *df = nil;
+    static dispatch_once_t onceToken;
+    dispatch_once(&onceToken, ^{
+        df = [NSDateFormatter new];
+        df.dateFormat = @"HH:mm:ss.SSS";
+    });
+    NSString *line = [NSString stringWithFormat:@"[%@][shim] %@\n", [df stringFromDate:[NSDate date]], msg];
+    NSString *path = @"/tmp/qwenglasses_shim.log";
+    NSFileHandle *fh = [NSFileHandle fileHandleForWritingAtPath:path];
+    if (fh) {
+        [fh seekToEndOfFile];
+        [fh writeData:[line dataUsingEncoding:NSUTF8StringEncoding]];
+        [fh closeFile];
+    } else {
+        [line writeToFile:path atomically:YES encoding:NSUTF8StringEncoding error:nil];
+    }
+}
+
+#pragma mark - 音频服务检测
+
+BOOL QGHasAudioService(NSString *address) {
+    IOBluetoothDevice *d = [IOBluetoothDevice deviceWithAddressString:address];
+    if (!d) return NO;
+    NSArray *records = d.services;
+    if (![records isKindOfClass:[NSArray class]] || records.count == 0) return NO;
+    IOBluetoothSDPUUID *audioSink = [[IOBluetoothSDPUUID alloc] initWithUUID16:kBluetoothSDPUUID16ServiceClassAudioSink]; // 0x110B A2DP
+    IOBluetoothSDPUUID *handsfree = [[IOBluetoothSDPUUID alloc] initWithUUID16:kBluetoothSDPUUID16ServiceClassHandsFree];  // 0x111E HFP
+
+    BOOL (^matchUUID)(IOBluetoothSDPUUID *) = ^BOOL(IOBluetoothSDPUUID *u) {
+        return u && ([u isEqualToUUID:audioSink] || [u isEqualToUUID:handsfree]);
+    };
+
+    for (IOBluetoothSDPServiceRecord *rec in records) {
+        if (![rec isKindOfClass:[IOBluetoothSDPServiceRecord class]]) continue;
+        IOBluetoothSDPDataElement *el = [rec getAttributeDataElement:kBluetoothSDPAttributeIdentifierServiceClassIDList];
+        if (!el) continue;
+        // 实测：ServiceClassIDList 可能是数组，也可能是单个 UUID 数据元素（Qwen Glasses 即后者）
+        NSArray *list = [el getArrayValue];
+        if (list) {
+            for (IOBluetoothSDPDataElement *item in list) {
+                if (matchUUID([item getUUIDValue])) return YES;
+            }
+        } else if (matchUUID([el getUUIDValue])) {
+            return YES;
+        }
+    }
+    return NO;
+}
+
+#pragma mark - 强制 Classic 连接（唯一验证可靠的连接方式）
+
+@interface QGSDPWaiter : NSObject
+@property (nonatomic, assign) IOReturn status;
+@property (nonatomic, assign) NSUInteger recordCount;
 @end
 
-@interface QGPairAgent : NSObject <IOBluetoothDevicePairDelegate>
-@property (nonatomic, strong) IOBluetoothDevice *device;
-@property (nonatomic, strong) IOBluetoothDevicePair *pair;
-@property (nonatomic, assign) BOOL finished;
-@property (nonatomic, copy) QGPairCompletion completion;
-@property (nonatomic, copy) QGPairEvent onEvent;
-@property (nonatomic, copy) NSString *autoPIN;      // nil/空 = 等待手动回复
-@property (nonatomic, assign) BOOL autoConfirm;
-@property (nonatomic, assign) BOOL awaitingPIN;
-@property (nonatomic, assign) BOOL awaitingConfirm;
-@property (nonatomic, copy) NSString *lastEvent;
-@end
-
-static QGPairAgent *gCurrentPairTask = nil;
-
-@implementation QGPairAgent
-
-- (void)emit:(NSString *)event detail:(NSString *)detail {
-    self.lastEvent = detail ? [NSString stringWithFormat:@"%@: %@", event, detail] : event;
-    if (self.onEvent) {
-        QGPairEvent cb = self.onEvent;
-        dispatch_async(dispatch_get_main_queue(), ^{ cb(event, detail); });
-    }
-}
-
-- (void)finishWithSuccess:(BOOL)success message:(NSString *)message {
-    if (self.finished) return;
-    self.finished = YES;
-    if (gCurrentPairTask == self) gCurrentPairTask = nil;
-    [QGBridge removeAgent:self];
-    [self emit:success ? @"finished" : @"failed" detail:message];
-    if (self.completion) {
-        NSString *addr = self.device.addressString ?: @"";
-        QGPairCompletion cb = self.completion;
-        self.completion = nil;
-        dispatch_async(dispatch_get_main_queue(), ^{ cb(addr, success, message); });
-    }
-}
-
-- (void)devicePairingStarted:(id)sender {
-    [self emit:@"started" detail:@"配对流程已启动"];
-}
-
-- (void)devicePairingConnecting:(id)sender {
-    [self emit:@"connecting" detail:@"正在建立基带连接…"];
-}
-
-- (void)devicePairingConnected:(id)sender {
-    [self emit:@"connected" detail:@"基带已连接，等待认证…"];
-}
-
-- (void)devicePairingPINCodeRequest:(id)sender {
-    if (self.autoPIN.length > 0) {
-        [self emit:@"pin_request" detail:[NSString stringWithFormat:@"设备请求 PIN，自动回复「%@」", self.autoPIN]];
-        [self replyPINString:self.autoPIN sender:sender];
-    } else {
-        self.awaitingPIN = YES;
-        [self emit:@"pin_request" detail:@"设备请求 PIN，请在 App 配对面板手动输入"];
-    }
-}
-
-- (void)replyPINString:(NSString *)pin sender:(id)sender {
-    BluetoothPINCode code;
-    memset(&code, 0, sizeof(code));
-    const char *utf8 = [pin UTF8String] ?: "";
-    ByteCount size = (ByteCount)MIN(strlen(utf8), sizeof(code.data));
-    memcpy(code.data, utf8, size);
-    [(IOBluetoothDevicePair *)sender replyPINCode:size PINCode:&code];
-    self.awaitingPIN = NO;
-}
-
-- (void)devicePairingUserConfirmationRequest:(id)sender numericValue:(BluetoothNumericValue)numericValue {
-    NSString *valueStr = [NSString stringWithFormat:@"%u", (unsigned)numericValue];
-    if (self.autoConfirm) {
-        [self emit:@"confirm_request" detail:[NSString stringWithFormat:@"数字比较 %@，自动接受", valueStr]];
-        [(IOBluetoothDevicePair *)sender replyUserConfirmation:YES];
-        self.awaitingConfirm = NO;
-    } else {
-        self.awaitingConfirm = YES;
-        [self emit:@"confirm_request" detail:[NSString stringWithFormat:@"等待确认数字: %@", valueStr]];
-    }
-}
-
-- (void)devicePairingUserPasskeyNotification:(id)sender passkey:(BluetoothPasskey)passkey {
-    [self emit:@"passkey_notify" detail:[NSString stringWithFormat:@"Passkey: %u", (unsigned)passkey]];
-}
-
-- (void)devicePairingFinished:(id)sender error:(IOReturn)error {
-    BOOL ok = (error == kIOReturnSuccess) || [self.device isPaired];
-    NSString *msg = ok ? @"配对成功"
-                       : [NSString stringWithFormat:@"配对失败 (IOReturn=0x%08x)%@", error,
-                            self.lastEvent.length ? [NSString stringWithFormat:@"，最后事件: %@", self.lastEvent] : @""];
-    [self finishWithSuccess:ok message:msg];
-}
-
-- (void)deviceSimplePairingComplete:(id)sender status:(BluetoothHCIEventStatus)status {
-    if (status != 0) {
-        [self emit:@"simple_pairing" detail:[NSString stringWithFormat:@"Simple Pairing 失败 status=%d", status]];
-        [self finishWithSuccess:NO message:[NSString stringWithFormat:@"Simple Pairing 失败 (status=%d)", status]];
-    } else {
-        [self emit:@"simple_pairing" detail:@"Simple Pairing 完成"];
-    }
-}
-
-@end
-
-@implementation QGBridge
-+ (NSMutableSet<QGPairAgent *> *)agents {
+static NSMutableSet<QGSDPWaiter *> *gSDPWaiters(void) {
     static NSMutableSet *set = nil;
     static dispatch_once_t onceToken;
     dispatch_once(&onceToken, ^{ set = [NSMutableSet set]; });
     return set;
 }
-+ (void)removeAgent:(QGPairAgent *)agent { [self.agents removeObject:agent]; }
+
+@implementation QGSDPWaiter
+- (void)sdpQueryComplete:(IOBluetoothDevice *)device status:(IOReturn)status {
+    self.status = status;
+    self.recordCount = device.services.count;
+    QGLog(@"SDP 完成 status=0x%08x records=%lu", status, (unsigned long)self.recordCount);
+    [gSDPWaiters() removeObject:self];
+}
 @end
 
-int32_t QGStartPairing(NSString *address,
-                       NSString *autoPIN,
-                       BOOL autoConfirm,
-                       NSTimeInterval timeoutSeconds,
-                       QGPairEvent onEvent,
-                       QGPairCompletion completion) {
-    IOBluetoothDevice *device = [IOBluetoothDevice deviceWithAddressString:address];
-    if (!device) {
-        if (completion) completion(address, NO, @"无法创建 IOBluetoothDevice（地址无效）");
-        return -1;
-    }
+void QGOpenClassicConnection(NSString *address, BOOL authRequired, NSTimeInterval waitTimeout, QGClassicConnectCompletion completion) {
+    QGLog(@"QGOpenClassicConnection %@ auth=%d", address, authRequired);
+    dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
+        void (^report)(BOOL, NSString *) = ^(BOOL ok, NSString *msg) {
+            QGLog(@"结果 ok=%d msg=%@", ok, msg);
+            if (completion) {
+                dispatch_async(dispatch_get_main_queue(), ^{ completion(address, ok, msg); });
+            }
+        };
 
-    QGPairAgent *agent = [QGPairAgent new];
-    agent.device = device;
-    agent.completion = completion;
-    agent.onEvent = onEvent;
-    agent.autoPIN = autoPIN;
-    agent.autoConfirm = autoConfirm;
-    agent.pair = [IOBluetoothDevicePair pairWithDevice:device];
-    agent.pair.delegate = agent;
+        IOBluetoothDevice *d = [IOBluetoothDevice deviceWithAddressString:address];
+        if (!d) { report(NO, @"地址无效"); return; }
 
-    IOReturn ret = [agent.pair start];
-    if (ret != kIOReturnSuccess) {
-        NSString *msg = [NSString stringWithFormat:@"配对无法启动 (IOReturn=0x%08x)，设备可能不在配对模式", ret];
-        if (completion) completion(address, NO, msg);
-        return -2;
-    }
+        // BR/EDR page，0x4000 * 0.625ms ≈ 10.24 秒超时；authenticationRequired 触发 Just Works 配对。
+        // 已验证：连接+认证成功后 bluetoothd 自动完成 SDP 并注册 A2DP/HFP。
+        IOReturn r = [d openConnection:nil withPageTimeout:0x4000 authenticationRequired:authRequired];
+        QGLog(@"openConnection -> 0x%08x paired=%d connected=%d", r, [d isPaired], [d isConnected]);
+        if (r != kIOReturnSuccess) {
+            report(NO, [NSString stringWithFormat:@"BR/EDR 连接失败 (IOReturn=0x%08x)，设备可能不在可连接状态", r]);
+            return;
+        }
 
-    [QGBridge.agents addObject:agent];
-    gCurrentPairTask = agent;
+        // fire-and-forget SDP（刷新本地服务记录缓存；waiter 需保持强引用，IOBluetooth 不保留 target）
+        QGSDPWaiter *w = [QGSDPWaiter new];
+        [gSDPWaiters() addObject:w];
+        IOReturn sr = [d performSDPQuery:w];
+        QGLog(@"performSDPQuery -> 0x%08x", sr);
+        if (sr != kIOReturnSuccess) [gSDPWaiters() removeObject:w];
 
-    // 超时兜底
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(timeoutSeconds * NSEC_PER_SEC)),
-                   dispatch_get_main_queue(), ^{
-        if (agent.awaitingPIN || agent.awaitingConfirm) {
-            [agent emit:@"timeout" detail:@"等待用户响应超时"];
-            [agent finishWithSuccess:[device isPaired] message:@"配对超时：等待 PIN/确认响应"];
+        // forget 后眼镜会"回连-断开-回连"抖动，单次采样 isConnected 会误判。
+        // 轮询采样：连接与音频服务各自一旦观测到即锁定。
+        BOOL connected = [d isConnected];
+        BOOL hasAudio = connected ? QGHasAudioService(address) : NO;
+        NSTimeInterval deadline = waitTimeout > 0 ? waitTimeout : 15;
+        NSDate *end = [NSDate dateWithTimeIntervalSinceNow:deadline];
+        while (!(connected && hasAudio) && [end timeIntervalSinceNow] > 0) {
+            [NSThread sleepForTimeInterval:0.5];
+            if (!connected) connected = [d isConnected];
+            if (connected && !hasAudio) hasAudio = QGHasAudioService(address);
+        }
+        QGLog(@"轮询结束 connected=%d hasAudio=%d name=%@", connected, hasAudio, d.name);
+
+        if (connected && hasAudio) {
+            report(YES, [NSString stringWithFormat:@"已连接 (paired=%d)，A2DP/HFP 音频服务已注册: %@",
+                          [d isPaired], d.name ?: @""]);
+        } else if (connected) {
+            report(NO, [NSString stringWithFormat:@"已连接 (%@) 但未发现音频服务——地址可能不是 Classic 地址",
+                          d.name ?: address]);
         } else {
-            [agent emit:@"timeout" detail:nil];
-            [agent finishWithSuccess:[device isPaired] message:@"配对超时（设备可能未在配对模式，或需要先在 BLE 通道完成握手）"];
+            report(NO, @"openConnection 返回成功但设备始终未稳定连接（连接抖动/被拒），请重试");
         }
     });
-    return 0;
-}
-
-void QGCancelPairing(NSString *address) {
-    for (QGPairAgent *agent in [QGBridge.agents copy]) {
-        if ([agent.device.addressString caseInsensitiveCompare:address] == NSOrderedSame) {
-            [agent.pair stop];
-            [agent emit:@"cancelled" detail:nil];
-            [agent finishWithSuccess:NO message:@"已取消"];
-        }
-    }
-}
-
-void QGPairReplyPIN(NSString *pin) {
-    QGPairAgent *agent = gCurrentPairTask;
-    if (agent && agent.awaitingPIN && !agent.finished) {
-        [agent emit:@"pin_reply" detail:[NSString stringWithFormat:@"手动回复 PIN「%@」", pin]];
-        [agent replyPINString:pin sender:agent.pair];
-    }
-}
-
-void QGPairReplyConfirmation(BOOL accept) {
-    QGPairAgent *agent = gCurrentPairTask;
-    if (agent && agent.awaitingConfirm && !agent.finished) {
-        agent.awaitingConfirm = NO;
-        [agent emit:@"confirm_reply" detail:accept ? @"手动接受" : @"手动拒绝"];
-        [agent.pair replyUserConfirmation:accept];
-    }
 }
 
 #pragma mark - 设备状态查询
@@ -214,87 +152,6 @@ NSString *QGDeviceName(NSString *address) {
     return d.name;
 }
 
-int32_t QGDisconnectDevice(NSString *address) {
-    IOBluetoothDevice *d = [IOBluetoothDevice deviceWithAddressString:address];
-    if (!d) return -1;
-    return (int32_t)[d closeConnection];
-}
-
-int32_t QGRequestAuthentication(NSString *address) {
-    IOBluetoothDevice *d = [IOBluetoothDevice deviceWithAddressString:address];
-    if (!d) return -1;
-    return (int32_t)[d requestAuthentication];
-}
-
-#pragma mark - 强制 Classic 连接（BR/EDR + 认证 + SDP）
-
-@interface QGSDPWaiter : NSObject
-@property (nonatomic, strong) dispatch_semaphore_t sem;
-@property (nonatomic, assign) IOReturn status;
-@property (nonatomic, strong) NSArray *records;
-@end
-
-@implementation QGSDPWaiter
-- (instancetype)init {
-    if (self = [super init]) {
-        _sem = dispatch_semaphore_create(0);
-        _status = kIOReturnError;
-    }
-    return self;
-}
-- (void)sdpQueryComplete:(IOBluetoothDevice *)device status:(IOReturn)status {
-    self.status = status;
-    self.records = device.services;
-    dispatch_semaphore_signal(self.sem);
-}
-@end
-
-void QGOpenClassicConnection(NSString *address, BOOL authRequired, NSTimeInterval sdpTimeout, QGClassicConnectCompletion completion) {
-    dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
-        void (^report)(BOOL, NSString *) = ^(BOOL ok, NSString *msg) {
-            if (completion) {
-                dispatch_async(dispatch_get_main_queue(), ^{ completion(address, ok, msg); });
-            }
-        };
-
-        IOBluetoothDevice *d = [IOBluetoothDevice deviceWithAddressString:address];
-        if (!d) { report(NO, @"地址无效"); return; }
-
-        // BR/EDR page，0x4000 * 0.625ms ≈ 10.24 秒超时；authenticationRequired 触发 Just Works 配对
-        IOReturn r = [d openConnection:nil withPageTimeout:0x4000 authenticationRequired:authRequired];
-        if (r != kIOReturnSuccess) {
-            report(NO, [NSString stringWithFormat:@"BR/EDR 连接失败 (IOReturn=0x%08x)，设备可能不在可连接状态", r]);
-            return;
-        }
-
-        // SDP 服务发现（让系统注册 A2DP/HFP）
-        QGSDPWaiter *w = [QGSDPWaiter new];
-        IOReturn sr = [d performSDPQuery:w];
-        NSString *svcInfo = @"";
-        if (sr == kIOReturnSuccess) {
-            dispatch_semaphore_wait(w.sem, dispatch_time(DISPATCH_TIME_NOW, (int64_t)(sdpTimeout * NSEC_PER_SEC)));
-            NSUInteger count = w.records.count;
-            NSMutableArray<NSString *> *names = [NSMutableArray array];
-            for (IOBluetoothSDPServiceRecord *rec in w.records) {
-                if ([rec isKindOfClass:[IOBluetoothSDPServiceRecord class]]) {
-                    NSString *n = [rec getServiceName];
-                    if (n.length) [names addObject:n];
-                }
-            }
-            svcInfo = [NSString stringWithFormat:@"，SDP 服务 %lu 条%@", (unsigned long)count,
-                       names.count ? [NSString stringWithFormat:@": %@", [names componentsJoinedByString:@", "]] : @""];
-        }
-
-        BOOL paired = [d isPaired];
-        BOOL connected = [d isConnected];
-        if (connected) {
-            report(YES, [NSString stringWithFormat:@"Classic 已连接 (paired=%d)%@", paired, svcInfo]);
-        } else {
-            report(NO, [NSString stringWithFormat:@"连接后状态异常 (paired=%d connected=%d)%@", paired, connected, svcInfo]);
-        }
-    });
-}
-
 NSArray<NSString *> *QGPairedAddresses(void) {
     NSMutableArray<NSString *> *result = [NSMutableArray array];
     for (id obj in [IOBluetoothDevice pairedDevices]) {
@@ -304,6 +161,12 @@ NSArray<NSString *> *QGPairedAddresses(void) {
         }
     }
     return result;
+}
+
+int32_t QGDisconnectDevice(NSString *address) {
+    IOBluetoothDevice *d = [IOBluetoothDevice deviceWithAddressString:address];
+    if (!d) return -1;
+    return (int32_t)[d closeConnection];
 }
 
 #pragma mark - 系统事件监听
@@ -381,5 +244,10 @@ void QGUnwatchDevice(id token) {
 
 void QGOpenBluetoothSettings(void) {
     NSURL *url = [NSURL URLWithString:@"x-apple.systempreferences:com.apple.BluetoothSettings"];
+    [[NSWorkspace sharedWorkspace] openURL:url];
+}
+
+void QGOpenSoundSettings(void) {
+    NSURL *url = [NSURL URLWithString:@"x-apple.systempreferences:com.apple.preference.sound"];
     [[NSWorkspace sharedWorkspace] openURL:url];
 }

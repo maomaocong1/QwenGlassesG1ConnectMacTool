@@ -38,6 +38,27 @@ final class LogStore: ObservableObject {
     private func append(_ entry: LogEntry) {
         entries.append(entry)
         if entries.count > 3000 { entries.removeFirst(entries.count - 3000) }
+        mirrorToFile(entry)
+    }
+
+    private static let fileLogURL = URL(fileURLWithPath: "/tmp/qwenglasses_app.log")
+    private static let fileTimeFormatter: DateFormatter = {
+        let f = DateFormatter()
+        f.dateFormat = "HH:mm:ss.SSS"
+        return f
+    }()
+
+    private func mirrorToFile(_ entry: LogEntry) {
+        let line = "[\(Self.fileTimeFormatter.string(from: entry.time))][\(entry.tag)][\(entry.direction.rawValue)] \(entry.text)\n"
+        if let data = line.data(using: .utf8) {
+            if let fh = try? FileHandle(forWritingTo: Self.fileLogURL) {
+                fh.seekToEndOfFile()
+                fh.write(data)
+                try? fh.close()
+            } else {
+                try? data.write(to: Self.fileLogURL)
+            }
+        }
     }
 
     func clear() { entries.removeAll() }
@@ -78,17 +99,12 @@ extension Data {
     }
 }
 
-/// 从广播 Manufacturer Data 中启发式提取疑似 MAC 地址的字符串（用于关联 Classic 地址）
+/// 从 Qwen Glasses 广播 Manufacturer Data 中提取 Classic MAC。
+/// 已实测的阿里布局（Company ID 0x01A8，小端 A8 01）：
+///   A8 01 | 57 6F 57 ("WoW") | 14 D9 21 | 00 00 | 87 55 40 DC D7 C4 (MAC 小端) | 0A 03
+/// 非此布局一律返回 nil——避免把随机设备的厂商数据尾字节误当 MAC（曾导致配错地址）。
 func extractPossibleMAC(from data: Data) -> String? {
-    guard data.count >= 6 else { return nil }
     let bytes = [UInt8](data)
-    // 常见布局：尾部 6 字节为 MAC（可能正序或倒序）
-    let tail = Array(bytes.suffix(6))
-    let candidates = [tail, tail.reversed()]
-    for c in candidates {
-        // 排除全 0 / 全 FF 等退化值
-        if Set(c).count <= 1 { continue }
-        return c.map { String(format: "%02X", $0) }.joined(separator: ":")
-    }
-    return nil
+    guard bytes.count >= 16, bytes[0] == 0xA8, bytes[1] == 0x01 else { return nil }
+    return bytes[10...15].reversed().map { String(format: "%02X", $0) }.joined(separator: ":")
 }
